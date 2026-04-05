@@ -1,0 +1,11 @@
+{
+  "user-123": {
+    "category_affinity": {
+      "korean": 1
+    },
+    "category_avoidance": {},
+    "price_affinity": {
+      "$$": 1
+    }
+  }
+}
