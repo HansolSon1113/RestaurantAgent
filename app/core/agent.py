@@ -12,38 +12,34 @@ Agentic loop
 3. Each tool is executed; observations are appended to the message history.
 4. Steps 2–3 repeat (up to MAX_ITERATIONS) until the LLM produces a ``stop``
    finish reason and returns a final JSON answer.
-5. If the AI key is absent or the loop exhausts iterations, the engine falls
-   back to the deterministic RecommendationEngine pipeline.
+5. If AI is not configured the call raises ``RuntimeError`` immediately.
+   There is no fallback to a deterministic pipeline.
 
 Available tools
 ---------------
 - search_restaurants   — query all configured data sources
 - get_user_preferences — retrieve persisted preference profile
-- assess_fraud_risk    — run heuristic fraud/viral-risk checks
+- assess_fraud_risk    — run LLM fraud/viral-risk checks
 - score_and_rank       — score candidates and return the top-N list
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from typing import Any
 
 import requests
 
 from app.config import Settings
 from app.core.interfaces import FraudDetector, PreferenceStore, RestaurantDataSource
-from app.core.models import AgentStep, Restaurant, ScoredRecommendation, SearchQuery
-from app.services.scoring import ScoringService
+from app.core.models import AgentStep, FraudAssessment, Restaurant, ScoredRecommendation, SearchQuery
+from app.services.scoring import FRAUD_RISK_PENALTY, ScoringService
+from app.utils import extract_json
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-FRAUD_RISK_PENALTY: float = 0.4
-"""Multiplier applied to a restaurant's fraud risk score when computing final score."""
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -109,6 +105,9 @@ class RestaurantAgent:
 
         # Ephemeral cache of restaurants discovered during a single run()
         self._candidate_cache: dict[str, Restaurant] = {}
+        # Fraud assessments computed during a single run() — reused by score_and_rank
+        # to avoid calling the fraud detector twice for the same restaurant.
+        self._fraud_cache: dict[str, FraudAssessment] = {}
 
         self._tools: list[_Tool] = self._build_tools()
 
@@ -122,11 +121,20 @@ class RestaurantAgent:
         query: SearchQuery,
         top_n: int = 5,
     ) -> "AgentResult":
-        """Execute the agentic loop and return recommendations with trace."""
-        if not self._settings.ai_api_key:
-            return self._fallback_pipeline(user_id, query, top_n)
+        """Execute the agentic loop and return recommendations with trace.
+
+        Raises:
+            RuntimeError: If AI is not configured, the API call fails, the
+                agent exhausts its iteration budget, or the LLM returns output
+                that cannot be parsed into valid recommendations.
+        """
+        if not self._settings.ai_enabled:
+            raise RuntimeError(
+                "AI is not configured. Set AI_API_KEY or AI_BASE_URL to enable the agent."
+            )
 
         self._candidate_cache = {}
+        self._fraud_cache = {}
         steps: list[AgentStep] = []
 
         messages: list[dict[str, Any]] = [
@@ -165,12 +173,12 @@ class RestaurantAgent:
 
         for iteration in range(self.MAX_ITERATIONS):
             try:
+                headers: dict[str, str] = {"Content-Type": "application/json"}
+                if self._settings.ai_api_key:
+                    headers["Authorization"] = f"Bearer {self._settings.ai_api_key}"
                 response = requests.post(
-                    f"{self._settings.ai_base_url.rstrip('/')}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self._settings.ai_api_key}",
-                        "Content-Type": "application/json",
-                    },
+                    f"{self._settings.effective_ai_base_url.rstrip('/')}/chat/completions",
+                    headers=headers,
                     json={
                         "model": self._settings.ai_model,
                         "temperature": 0.2,
@@ -181,8 +189,8 @@ class RestaurantAgent:
                     timeout=self._settings.request_timeout_seconds,
                 )
                 response.raise_for_status()
-            except Exception:
-                return self._fallback_pipeline(user_id, query, top_n, steps=steps)
+            except Exception as exc:
+                raise RuntimeError(f"AI API call failed: {exc}") from exc
 
             choice = response.json()["choices"][0]
             message: dict[str, Any] = choice["message"]
@@ -230,8 +238,10 @@ class RestaurantAgent:
                 recs = self._parse_llm_recommendations(content, user_id, query, top_n)
                 return AgentResult(recommendations=recs, steps=steps, used_agent=True)
 
-        # Exhausted iterations — fall back
-        return self._fallback_pipeline(user_id, query, top_n, steps=steps)
+        # Exhausted iterations
+        raise RuntimeError(
+            f"Agent exhausted {self.MAX_ITERATIONS} iterations without producing a final answer."
+        )
 
     # ------------------------------------------------------------------
     # Tool handlers (called by the LLM via tool_calls)
@@ -293,6 +303,7 @@ class RestaurantAgent:
         if restaurant is None:
             return {"error": f"Restaurant '{restaurant_id}' not found in search results."}
         assessment = self._fraud_detector.assess(restaurant)
+        self._fraud_cache[restaurant_id] = assessment
         return {
             "restaurant_id": restaurant_id,
             "risk_score": assessment.risk_score,
@@ -312,7 +323,10 @@ class RestaurantAgent:
             restaurant = self._candidate_cache.get(rid)
             if restaurant is None:
                 continue
-            fraud = self._fraud_detector.assess(restaurant)
+            # Reuse a cached fraud assessment from a prior assess_fraud_risk call
+            # so we never hit the fraud detector twice for the same restaurant.
+            fraud = self._fraud_cache.get(rid) or self._fraud_detector.assess(restaurant)
+            self._fraud_cache[rid] = fraud
             base = self._scoring_service.base_score(restaurant)
             pref = self._scoring_service.preference_score(restaurant, profile)
             final = base + pref - (fraud.risk_score * FRAUD_RISK_PENALTY)
@@ -412,6 +426,8 @@ class RestaurantAgent:
                 description=(
                     "Score a list of restaurant candidates using base quality metrics, "
                     "user preference affinity, and fraud-risk penalties. "
+                    "Reuses any fraud assessments already obtained via assess_fraud_risk "
+                    "to avoid redundant computation. "
                     "Returns the top-N candidates sorted by final score."
                 ),
                 parameters={
@@ -444,56 +460,47 @@ class RestaurantAgent:
         query: SearchQuery,
         top_n: int,
     ) -> list[ScoredRecommendation]:
-        """Attempt to parse the LLM's final JSON answer into ScoredRecommendations."""
+        """Parse the LLM's final JSON answer into ScoredRecommendations.
+
+        Raises:
+            RuntimeError: If the content cannot be parsed as JSON or yields no
+                recognizable restaurant IDs from the current candidate cache.
+        """
         try:
-            items: list[dict[str, Any]] = json.loads(content)
-            recs: list[ScoredRecommendation] = []
-            for item in items[:top_n]:
-                rid = item.get("restaurant_id", "")
-                restaurant = self._candidate_cache.get(rid)
-                if restaurant is None:
-                    continue
+            items: list[dict[str, Any]] = json.loads(extract_json(content))
+        except Exception as exc:
+            raise RuntimeError(f"Agent returned invalid JSON: {exc}") from exc
+
+        recs: list[ScoredRecommendation] = []
+        for item in items[:top_n]:
+            rid = item.get("restaurant_id", "")
+            restaurant = self._candidate_cache.get(rid)
+            if restaurant is None:
+                continue
+            fraud = self._fraud_cache.get(rid)
+            if fraud is None:
                 fraud = self._fraud_detector.assess(restaurant)
-                base = self._scoring_service.base_score(restaurant)
-                profile = self._preference_store.get_profile(user_id)
-                pref = self._scoring_service.preference_score(restaurant, profile)
-                final = base + pref - (fraud.risk_score * FRAUD_RISK_PENALTY)
-                rec = ScoredRecommendation(
-                    restaurant=restaurant,
-                    base_score=base,
-                    preference_score=pref,
-                    fraud_risk_score=fraud.risk_score,
-                    final_score=final,
-                    warnings=list(item.get("warnings", fraud.warnings)),
-                    reason=item.get("reason", ""),
-                )
-                recs.append(rec)
-            if recs:
-                return recs
-        except Exception:
-            pass
-        return self._fallback_pipeline(user_id, query, top_n).recommendations
+                self._fraud_cache[rid] = fraud
+            base = self._scoring_service.base_score(restaurant)
+            profile = self._preference_store.get_profile(user_id)
+            pref = self._scoring_service.preference_score(restaurant, profile)
+            final = base + pref - (fraud.risk_score * FRAUD_RISK_PENALTY)
+            rec = ScoredRecommendation(
+                restaurant=restaurant,
+                base_score=base,
+                preference_score=pref,
+                fraud_risk_score=fraud.risk_score,
+                final_score=final,
+                warnings=list(item.get("warnings", fraud.warnings)),
+                reason=item.get("reason", ""),
+            )
+            recs.append(rec)
 
-    def _fallback_pipeline(
-        self,
-        user_id: str,
-        query: SearchQuery,
-        top_n: int,
-        steps: list[AgentStep] | None = None,
-    ) -> "AgentResult":
-        """Run the deterministic scoring pipeline when the agent cannot complete."""
-        from app.core.engine import RecommendationEngine
-        from app.services.local_ai_reasoner import LocalAIReasoner
-
-        engine = RecommendationEngine(
-            sources=self._sources,
-            preference_store=self._preference_store,
-            fraud_detector=self._fraud_detector,
-            ai_reasoner=LocalAIReasoner(),
-            scoring_service=self._scoring_service,
-        )
-        recs = engine.recommend(user_id=user_id, query=query, top_n=top_n)
-        return AgentResult(recommendations=recs, steps=steps or [], used_agent=False)
+        if not recs:
+            raise RuntimeError(
+                "Agent final answer contained no recognizable restaurant IDs."
+            )
+        return recs
 
 
 # ---------------------------------------------------------------------------

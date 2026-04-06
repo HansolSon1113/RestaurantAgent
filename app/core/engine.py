@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.core.interfaces import AIReasoner, FraudDetector, PreferenceStore, RestaurantDataSource
 from app.core.models import Restaurant, ScoredRecommendation, SearchQuery
-from app.services.scoring import ScoringService
+from app.services.scoring import FRAUD_RISK_PENALTY, ScoringService
 
 
 class RecommendationEngine:
@@ -29,7 +29,7 @@ class RecommendationEngine:
             fraud_assessment = self._fraud_detector.assess(restaurant)
             base_score = self._scoring_service.base_score(restaurant)
             preference_score = self._scoring_service.preference_score(restaurant, profile)
-            final_score = base_score + preference_score - (fraud_assessment.risk_score * 0.4)
+            final_score = base_score + preference_score - (fraud_assessment.risk_score * FRAUD_RISK_PENALTY)
             recommendations.append(
                 ScoredRecommendation(
                     restaurant=restaurant,

@@ -78,7 +78,7 @@ def test_ai_reasoner_uses_mock_ai_api(monkeypatch):
     assert "Minor viral buzz" in out[0].warnings[0]
 
 
-def test_ai_reasoner_falls_back_when_ai_fails(monkeypatch):
+def test_ai_reasoner_raises_when_ai_fails(monkeypatch):
     test_settings = replace(settings, ai_api_key="fake-key", ai_base_url="https://mock-ai.local")
     reasoner = ExternalAIReasoner(test_settings)
 
@@ -106,6 +106,6 @@ def test_ai_reasoner_falls_back_when_ai_fails(monkeypatch):
 
     monkeypatch.setattr(ai_reasoner_module.requests, "post", _explode)
 
-    out = reasoner.explain(SearchQuery(where="Tokyo", category="japanese"), [rec])
-
-    assert "Strong match for japanese in Tokyo" in out[0].reason
+    import pytest
+    with pytest.raises(RuntimeError):
+        reasoner.explain(SearchQuery(where="Tokyo", category="japanese"), [rec])

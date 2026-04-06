@@ -46,20 +46,17 @@ class _MockResponse:
 
 
 # ---------------------------------------------------------------------------
-# Tests — no API key: falls back to heuristic detector
+# Tests — no API key: raises RuntimeError (no heuristic fallback)
 # ---------------------------------------------------------------------------
 
-def test_llm_fraud_detector_falls_back_without_api_key():
-    test_settings = replace(settings, ai_api_key="")
+def test_llm_fraud_detector_raises_without_ai_configured():
+    import pytest
+    test_settings = replace(settings, ai_api_key="", ai_base_url="")
     detector = LLMFraudDetector(test_settings)
 
-    # Suspicious restaurant: high rating, very few reviews
     restaurant = _make_restaurant(rating=4.9, review_count=5)
-    assessment = detector.assess(restaurant)
-
-    # Heuristic fallback should flag it
-    assert assessment.risk_score > 0.0
-    assert assessment.warnings
+    with pytest.raises(RuntimeError, match="AI is not configured"):
+        detector.assess(restaurant)
 
 
 # ---------------------------------------------------------------------------
@@ -119,10 +116,11 @@ def test_llm_fraud_detector_uses_llm_when_api_key_set(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Tests — LLM call fails: falls back to heuristic detector
+# Tests — LLM call fails: raises RuntimeError (no heuristic fallback)
 # ---------------------------------------------------------------------------
 
-def test_llm_fraud_detector_falls_back_on_llm_error(monkeypatch):
+def test_llm_fraud_detector_raises_on_llm_error(monkeypatch):
+    import pytest
     test_settings = replace(
         settings, ai_api_key="fake-key", ai_base_url="https://mock-ai.local"
     )
@@ -133,19 +131,17 @@ def test_llm_fraud_detector_falls_back_on_llm_error(monkeypatch):
 
     monkeypatch.setattr(llm_fd_module.requests, "post", _explode)
 
-    # Suspicious restaurant so heuristic fallback should produce warnings
     restaurant = _make_restaurant(rating=4.9, review_count=5)
-    assessment = detector.assess(restaurant)
-
-    assert assessment.risk_score > 0.0
-    assert assessment.warnings
+    with pytest.raises(RuntimeError, match="LLM fraud detection failed"):
+        detector.assess(restaurant)
 
 
 # ---------------------------------------------------------------------------
-# Tests — LLM returns bad JSON: falls back gracefully
+# Tests — LLM returns bad JSON: raises RuntimeError (no heuristic fallback)
 # ---------------------------------------------------------------------------
 
-def test_llm_fraud_detector_falls_back_on_bad_json(monkeypatch):
+def test_llm_fraud_detector_raises_on_bad_json(monkeypatch):
+    import pytest
     test_settings = replace(
         settings, ai_api_key="fake-key", ai_base_url="https://mock-ai.local"
     )
@@ -163,10 +159,8 @@ def test_llm_fraud_detector_falls_back_on_bad_json(monkeypatch):
 
     monkeypatch.setattr(llm_fd_module.requests, "post", _mock_bad_json)
 
-    assessment = detector.assess(restaurant)
-
-    # Fallback heuristic should flag the suspicious restaurant
-    assert assessment.risk_score > 0.0
+    with pytest.raises(RuntimeError, match="LLM fraud detection failed"):
+        detector.assess(restaurant)
 
 
 # ---------------------------------------------------------------------------
