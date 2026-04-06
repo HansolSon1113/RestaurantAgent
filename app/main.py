@@ -10,7 +10,7 @@ from app.core.agent import RestaurantAgent
 from app.core.engine import RecommendationEngine
 from app.core.models import SearchQuery
 from app.services.ai_reasoner import ExternalAIReasoner
-from app.services.fraud_detector import HeuristicFraudDetector
+from app.services.llm_fraud_detector import LLMFraudDetector
 from app.services.preference_store import JsonPreferenceStore
 from app.services.scoring import ScoringService
 from app.sources.foursquare_source import FoursquareSource
@@ -50,7 +50,7 @@ def build_engine() -> RecommendationEngine:
     return RecommendationEngine(
         sources=_shared_sources(),
         preference_store=JsonPreferenceStore(settings.preferences_file),
-        fraud_detector=HeuristicFraudDetector(),
+        fraud_detector=LLMFraudDetector(settings),
         ai_reasoner=ExternalAIReasoner(settings),
         scoring_service=ScoringService(),
     )
@@ -60,7 +60,7 @@ def build_agent() -> RestaurantAgent:
     return RestaurantAgent(
         sources=_shared_sources(),
         preference_store=JsonPreferenceStore(settings.preferences_file),
-        fraud_detector=HeuristicFraudDetector(),
+        fraud_detector=LLMFraudDetector(settings),
         scoring_service=ScoringService(),
         settings=settings,
     )
