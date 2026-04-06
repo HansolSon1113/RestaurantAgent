@@ -4,8 +4,8 @@ Unlike the rule-based ``HeuristicFraudDetector``, this implementation asks
 an LLM to reason step-by-step through each fraud signal before producing a
 final ``risk_score`` and a list of human-readable ``warnings``.
 
-Falls back to ``HeuristicFraudDetector`` when:
-- No ``ai_api_key`` is configured in ``Settings``.
+Raises ``RuntimeError`` when:
+- No AI is configured in ``Settings`` (no key and no base URL).
 - The LLM call fails for any reason (network error, bad JSON, etc.).
 """
 
@@ -18,7 +18,6 @@ import requests
 from app.config import Settings
 from app.core.interfaces import FraudDetector
 from app.core.models import FraudAssessment, Restaurant
-from app.services.fraud_detector import HeuristicFraudDetector
 from app.utils import extract_json
 
 
@@ -30,6 +29,8 @@ class LLMFraudDetector(FraudDetector):
     ``risk_score`` (0.0 = clean, 1.0 = high risk) and a list of warning
     strings.  The ``thinking`` field in the JSON response captures the full
     step-by-step reasoning trace.
+
+    Raises ``RuntimeError`` when AI is not configured or the API call fails.
     """
 
     _SYSTEM_PROMPT = (
@@ -50,11 +51,12 @@ class LLMFraudDetector(FraudDetector):
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._fallback = HeuristicFraudDetector()
 
     def assess(self, restaurant: Restaurant) -> FraudAssessment:
         if not self._settings.ai_enabled:
-            return self._fallback.assess(restaurant)
+            raise RuntimeError(
+                "AI is not configured. Set AI_API_KEY or AI_BASE_URL to enable fraud detection."
+            )
 
         payload = {
             "restaurant_id": restaurant.restaurant_id,
@@ -105,5 +107,5 @@ class LLMFraudDetector(FraudDetector):
                 risk_score=min(1.0, max(0.0, risk_score)),
                 warnings=warnings,
             )
-        except Exception:
-            return self._fallback.assess(restaurant)
+        except Exception as exc:
+            raise RuntimeError(f"LLM fraud detection failed: {exc}") from exc

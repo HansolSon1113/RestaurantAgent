@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
+import pytest
+
 import app.core.agent as agent_module
 from app.config import settings
 from app.core.agent import AgentResult, RestaurantAgent
@@ -45,20 +47,16 @@ class _MockResponse:
 
 
 # ---------------------------------------------------------------------------
-# Tests — no AI key  (falls back to deterministic pipeline)
+# Tests — no AI configured → RuntimeError, not a silent fallback
 # ---------------------------------------------------------------------------
 
-def test_agent_falls_back_without_api_key(tmp_path):
-    ag = _build_agent(tmp_path, {"ai_api_key": ""})
+def test_agent_raises_without_ai_configured(tmp_path):
+    ag = _build_agent(tmp_path, {"ai_api_key": "", "ai_base_url": ""})
 
     from app.core.models import SearchQuery
 
-    result = ag.run(user_id="u1", query=SearchQuery(where="Seoul", category="korean"), top_n=3)
-
-    assert isinstance(result, AgentResult)
-    assert result.used_agent is False
-    assert result.recommendations
-    assert result.steps == []
+    with pytest.raises(RuntimeError, match="AI is not configured"):
+        ag.run(user_id="u1", query=SearchQuery(where="Seoul", category="korean"), top_n=3)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +64,7 @@ def test_agent_falls_back_without_api_key(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_agent_executes_tool_calls_then_stops(monkeypatch, tmp_path):
-    """Simulate LLM that calls search_restaurants, then score_and_rank, then stops."""
+    """Simulate LLM that calls search_restaurants, score_and_rank, then stops."""
     from app.core.models import SearchQuery
 
     ag = _build_agent(
@@ -74,15 +72,12 @@ def test_agent_executes_tool_calls_then_stops(monkeypatch, tmp_path):
         {"ai_api_key": "fake-key", "ai_base_url": "https://mock-ai.local"},
     )
 
-    # Pre-populate the candidate cache so score_and_rank can find the restaurant
+    # Discover the restaurant_id we'll use in the final answer
     from app.sources.local_sample import LocalSampleSource
-
-    sample_source = LocalSampleSource()
     from app.core.models import SearchQuery as SQ
-    candidates = sample_source.search(SQ(where="Seoul", category="korean"))
+    candidates = LocalSampleSource().search(SQ(where="Seoul", category="korean"))
     assert candidates, "LocalSampleSource must return at least one Seoul/korean restaurant"
     first = candidates[0]
-    ag._candidate_cache = {first.restaurant_id: first}
 
     call_count = [0]
     import json as json_mod
@@ -91,7 +86,7 @@ def test_agent_executes_tool_calls_then_stops(monkeypatch, tmp_path):
         call_count[0] += 1
 
         if call_count[0] == 1:
-            # First call: LLM decides to call score_and_rank
+            # First call: LLM searches for restaurants (populates the cache)
             return _MockResponse(
                 {
                     "choices": [
@@ -103,6 +98,34 @@ def test_agent_executes_tool_calls_then_stops(monkeypatch, tmp_path):
                                 "tool_calls": [
                                     {
                                         "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "search_restaurants",
+                                            "arguments": json_mod.dumps(
+                                                {"city": "Seoul", "category": "korean"}
+                                            ),
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ]
+                }
+            )
+
+        if call_count[0] == 2:
+            # Second call: LLM scores the results
+            return _MockResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_2",
                                         "type": "function",
                                         "function": {
                                             "name": "score_and_rank",
@@ -121,35 +144,35 @@ def test_agent_executes_tool_calls_then_stops(monkeypatch, tmp_path):
                     ]
                 }
             )
-        else:
-            # Second call: LLM returns final answer
-            final = json_mod.dumps(
-                [
+
+        # Third call: LLM returns final answer
+        final = json_mod.dumps(
+            [
+                {
+                    "restaurant_id": first.restaurant_id,
+                    "name": first.name,
+                    "city": first.city,
+                    "category": first.category,
+                    "rating": first.rating,
+                    "price_level": first.price_level,
+                    "reason": "Great Korean food with strong reviews.",
+                    "warnings": [],
+                }
+            ]
+        )
+        return _MockResponse(
+            {
+                "choices": [
                     {
-                        "restaurant_id": first.restaurant_id,
-                        "name": first.name,
-                        "city": first.city,
-                        "category": first.category,
-                        "rating": first.rating,
-                        "price_level": first.price_level,
-                        "reason": "Great Korean food with strong reviews.",
-                        "warnings": [],
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": final,
+                        },
                     }
                 ]
-            )
-            return _MockResponse(
-                {
-                    "choices": [
-                        {
-                            "finish_reason": "stop",
-                            "message": {
-                                "role": "assistant",
-                                "content": final,
-                            },
-                        }
-                    ]
-                }
-            )
+            }
+        )
 
     monkeypatch.setattr(agent_module.requests, "post", _mock_post)
 
@@ -162,16 +185,17 @@ def test_agent_executes_tool_calls_then_stops(monkeypatch, tmp_path):
     assert result.used_agent is True
     assert result.recommendations
     assert result.recommendations[0].reason  # LLM-provided reason must be non-empty
-    # One step recorded for the tool call
-    assert len(result.steps) == 1
-    assert result.steps[0].tool == "score_and_rank"
+    # Two steps recorded: search_restaurants + score_and_rank
+    assert len(result.steps) == 2
+    assert result.steps[0].tool == "search_restaurants"
+    assert result.steps[1].tool == "score_and_rank"
 
 
 # ---------------------------------------------------------------------------
-# Tests — AI key present, LLM API fails → falls back to pipeline
+# Tests — AI key present, LLM API fails → RuntimeError, not a silent fallback
 # ---------------------------------------------------------------------------
 
-def test_agent_falls_back_on_api_error(monkeypatch, tmp_path):
+def test_agent_raises_on_api_error(monkeypatch, tmp_path):
     from app.core.models import SearchQuery
 
     ag = _build_agent(
@@ -184,11 +208,8 @@ def test_agent_falls_back_on_api_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(agent_module.requests, "post", _explode)
 
-    result = ag.run(user_id="u3", query=SearchQuery(where="Seoul"), top_n=3)
-
-    assert isinstance(result, AgentResult)
-    assert result.used_agent is False
-    assert result.recommendations  # fallback pipeline should still return results
+    with pytest.raises(RuntimeError, match="AI API call failed"):
+        ag.run(user_id="u3", query=SearchQuery(where="Seoul"), top_n=3)
 
 
 # ---------------------------------------------------------------------------
@@ -238,14 +259,14 @@ def test_tool_score_and_rank_returns_sorted_results(tmp_path):
 # Tests — /agent/recommend API endpoint
 # ---------------------------------------------------------------------------
 
-def test_agent_recommend_endpoint_returns_expected_keys(tmp_path, monkeypatch):
-    """Integration test: /agent/recommend falls back cleanly without an AI key."""
+def test_agent_recommend_endpoint_returns_503_without_ai(tmp_path, monkeypatch):
+    """Integration test: /agent/recommend returns 503 when AI is not configured."""
     from fastapi.testclient import TestClient
 
     import app.main as main_module
 
     pref_file = tmp_path / "preferences.json"
-    test_settings = replace(settings, ai_api_key="", preferences_file=str(pref_file))
+    test_settings = replace(settings, ai_api_key="", ai_base_url="", preferences_file=str(pref_file))
 
     monkeypatch.setattr(main_module, "agent", RestaurantAgent(
         sources=[LocalSampleSource()],
@@ -255,16 +276,11 @@ def test_agent_recommend_endpoint_returns_expected_keys(tmp_path, monkeypatch):
         settings=test_settings,
     ))
 
-    client = TestClient(main_module.app)
+    client = TestClient(main_module.app, raise_server_exceptions=False)
     response = client.post(
         "/agent/recommend",
         json={"user_id": "u_api", "where": "Seoul", "category": "korean", "top_n": 3},
     )
 
-    assert response.status_code == 200
-    body = response.json()
-    assert "used_agent" in body
-    assert "agent_steps" in body
-    assert "best_match" in body
-    assert "recommendations" in body
-    assert body["recommendations"]
+    assert response.status_code == 503
+    assert "AI is not configured" in response.json()["detail"]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from app.config import settings
@@ -94,7 +94,10 @@ def recommend(payload: RecommendationRequest) -> dict:
         travel_plan=payload.travel_plan,
         party_size=payload.party_size,
     )
-    recs = engine.recommend(user_id=payload.user_id, query=query, top_n=payload.top_n)
+    try:
+        recs = engine.recommend(user_id=payload.user_id, query=query, top_n=payload.top_n)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "best_match": _to_output(recs[0]) if recs else None,
         "recommendations": [_to_output(rec) for rec in recs],
@@ -118,7 +121,7 @@ def agent_recommend(payload: RecommendationRequest) -> dict:
 
     Uses ``RestaurantAgent`` which lets the LLM autonomously decide which
     tools to call (search, fraud-check, score-and-rank) and in what order.
-    Falls back to the deterministic pipeline when no AI key is configured.
+    Returns HTTP 503 when AI is not configured or the AI service is unavailable.
     """
     query = SearchQuery(
         where=payload.where,
@@ -128,7 +131,10 @@ def agent_recommend(payload: RecommendationRequest) -> dict:
         travel_plan=payload.travel_plan,
         party_size=payload.party_size,
     )
-    result = agent.run(user_id=payload.user_id, query=query, top_n=payload.top_n)
+    try:
+        result = agent.run(user_id=payload.user_id, query=query, top_n=payload.top_n)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "used_agent": result.used_agent,
         "agent_steps": [
