@@ -33,17 +33,14 @@ import requests
 
 from app.config import Settings
 from app.core.interfaces import FraudDetector, PreferenceStore, RestaurantDataSource
-from app.core.models import AgentStep, Restaurant, ScoredRecommendation, SearchQuery
-from app.services.scoring import ScoringService
+from app.core.models import AgentStep, FraudAssessment, Restaurant, ScoredRecommendation, SearchQuery
+from app.services.scoring import FRAUD_RISK_PENALTY, ScoringService
+from app.utils import extract_json
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-FRAUD_RISK_PENALTY: float = 0.4
-"""Multiplier applied to a restaurant's fraud risk score when computing final score."""
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -109,6 +106,9 @@ class RestaurantAgent:
 
         # Ephemeral cache of restaurants discovered during a single run()
         self._candidate_cache: dict[str, Restaurant] = {}
+        # Fraud assessments computed during a single run() — reused by score_and_rank
+        # to avoid calling the fraud detector twice for the same restaurant.
+        self._fraud_cache: dict[str, FraudAssessment] = {}
 
         self._tools: list[_Tool] = self._build_tools()
 
@@ -123,10 +123,11 @@ class RestaurantAgent:
         top_n: int = 5,
     ) -> "AgentResult":
         """Execute the agentic loop and return recommendations with trace."""
-        if not self._settings.ai_api_key:
+        if not self._settings.ai_enabled:
             return self._fallback_pipeline(user_id, query, top_n)
 
         self._candidate_cache = {}
+        self._fraud_cache = {}
         steps: list[AgentStep] = []
 
         messages: list[dict[str, Any]] = [
@@ -165,12 +166,12 @@ class RestaurantAgent:
 
         for iteration in range(self.MAX_ITERATIONS):
             try:
+                headers: dict[str, str] = {"Content-Type": "application/json"}
+                if self._settings.ai_api_key:
+                    headers["Authorization"] = f"Bearer {self._settings.ai_api_key}"
                 response = requests.post(
-                    f"{self._settings.ai_base_url.rstrip('/')}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self._settings.ai_api_key}",
-                        "Content-Type": "application/json",
-                    },
+                    f"{self._settings.effective_ai_base_url.rstrip('/')}/chat/completions",
+                    headers=headers,
                     json={
                         "model": self._settings.ai_model,
                         "temperature": 0.2,
@@ -293,6 +294,7 @@ class RestaurantAgent:
         if restaurant is None:
             return {"error": f"Restaurant '{restaurant_id}' not found in search results."}
         assessment = self._fraud_detector.assess(restaurant)
+        self._fraud_cache[restaurant_id] = assessment
         return {
             "restaurant_id": restaurant_id,
             "risk_score": assessment.risk_score,
@@ -312,7 +314,10 @@ class RestaurantAgent:
             restaurant = self._candidate_cache.get(rid)
             if restaurant is None:
                 continue
-            fraud = self._fraud_detector.assess(restaurant)
+            # Reuse a cached fraud assessment from a prior assess_fraud_risk call
+            # so we never hit the fraud detector twice for the same restaurant.
+            fraud = self._fraud_cache.get(rid) or self._fraud_detector.assess(restaurant)
+            self._fraud_cache[rid] = fraud
             base = self._scoring_service.base_score(restaurant)
             pref = self._scoring_service.preference_score(restaurant, profile)
             final = base + pref - (fraud.risk_score * FRAUD_RISK_PENALTY)
@@ -412,6 +417,8 @@ class RestaurantAgent:
                 description=(
                     "Score a list of restaurant candidates using base quality metrics, "
                     "user preference affinity, and fraud-risk penalties. "
+                    "Reuses any fraud assessments already obtained via assess_fraud_risk "
+                    "to avoid redundant computation. "
                     "Returns the top-N candidates sorted by final score."
                 ),
                 parameters={
@@ -446,14 +453,17 @@ class RestaurantAgent:
     ) -> list[ScoredRecommendation]:
         """Attempt to parse the LLM's final JSON answer into ScoredRecommendations."""
         try:
-            items: list[dict[str, Any]] = json.loads(content)
+            items: list[dict[str, Any]] = json.loads(extract_json(content))
             recs: list[ScoredRecommendation] = []
             for item in items[:top_n]:
                 rid = item.get("restaurant_id", "")
                 restaurant = self._candidate_cache.get(rid)
                 if restaurant is None:
                     continue
-                fraud = self._fraud_detector.assess(restaurant)
+                fraud = self._fraud_cache.get(rid)
+                if fraud is None:
+                    fraud = self._fraud_detector.assess(restaurant)
+                    self._fraud_cache[rid] = fraud
                 base = self._scoring_service.base_score(restaurant)
                 profile = self._preference_store.get_profile(user_id)
                 pref = self._scoring_service.preference_score(restaurant, profile)

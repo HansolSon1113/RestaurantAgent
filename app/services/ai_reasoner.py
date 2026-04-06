@@ -7,6 +7,7 @@ import requests
 from app.config import Settings
 from app.core.interfaces import AIReasoner
 from app.core.models import ScoredRecommendation, SearchQuery
+from app.utils import extract_json
 
 
 class ExternalAIReasoner(AIReasoner):
@@ -21,7 +22,7 @@ class ExternalAIReasoner(AIReasoner):
         if not recommendations:
             return recommendations
 
-        if not self._settings.ai_api_key:
+        if not self._settings.ai_enabled:
             return self._fallback_explanations(recommendations)
 
         try:
@@ -39,12 +40,12 @@ class ExternalAIReasoner(AIReasoner):
                 for r in recommendations
             ]
 
+            headers: dict[str, str] = {"Content-Type": "application/json"}
+            if self._settings.ai_api_key:
+                headers["Authorization"] = f"Bearer {self._settings.ai_api_key}"
             response = requests.post(
-                f"{self._settings.ai_base_url.rstrip('/')}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self._settings.ai_api_key}",
-                    "Content-Type": "application/json",
-                },
+                f"{self._settings.effective_ai_base_url.rstrip('/')}/chat/completions",
+                headers=headers,
                 json={
                     "model": self._settings.ai_model,
                     "temperature": 0.2,
@@ -85,7 +86,7 @@ class ExternalAIReasoner(AIReasoner):
                 .get("content", "")
                 .strip()
             )
-            parsed = json.loads(content)
+            parsed = json.loads(extract_json(content))
             reason_map = {item["id"]: item for item in parsed.get("reasons", [])}
 
             for rec in recommendations:

@@ -19,6 +19,7 @@ from app.config import Settings
 from app.core.interfaces import FraudDetector
 from app.core.models import FraudAssessment, Restaurant
 from app.services.fraud_detector import HeuristicFraudDetector
+from app.utils import extract_json
 
 
 class LLMFraudDetector(FraudDetector):
@@ -52,7 +53,7 @@ class LLMFraudDetector(FraudDetector):
         self._fallback = HeuristicFraudDetector()
 
     def assess(self, restaurant: Restaurant) -> FraudAssessment:
-        if not self._settings.ai_api_key:
+        if not self._settings.ai_enabled:
             return self._fallback.assess(restaurant)
 
         payload = {
@@ -67,12 +68,12 @@ class LLMFraudDetector(FraudDetector):
         }
 
         try:
+            headers: dict[str, str] = {"Content-Type": "application/json"}
+            if self._settings.ai_api_key:
+                headers["Authorization"] = f"Bearer {self._settings.ai_api_key}"
             response = requests.post(
-                f"{self._settings.ai_base_url.rstrip('/')}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self._settings.ai_api_key}",
-                    "Content-Type": "application/json",
-                },
+                f"{self._settings.effective_ai_base_url.rstrip('/')}/chat/completions",
+                headers=headers,
                 json={
                     "model": self._settings.ai_model,
                     "temperature": 0.1,
@@ -97,7 +98,7 @@ class LLMFraudDetector(FraudDetector):
                 .get("content", "")
                 .strip()
             )
-            parsed = json.loads(content)
+            parsed = json.loads(extract_json(content))
             risk_score = float(parsed.get("risk_score", 0.0))
             warnings = [str(w) for w in parsed.get("warnings", [])]
             return FraudAssessment(

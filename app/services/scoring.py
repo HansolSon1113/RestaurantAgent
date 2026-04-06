@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from app.core.models import Restaurant, UserPreferenceProfile
 
+FRAUD_RISK_PENALTY: float = 0.4
+"""Multiplier applied to a restaurant's fraud risk score when computing final score."""
+
 
 class ScoringService:
     def preference_score(self, restaurant: Restaurant, profile: UserPreferenceProfile) -> float:
