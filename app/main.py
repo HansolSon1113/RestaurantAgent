@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.core.agent import RestaurantAgent
 from app.core.engine import RecommendationEngine
 from app.core.models import SearchQuery
 from app.services.ai_reasoner import ExternalAIReasoner
@@ -36,14 +37,18 @@ class FeedbackRequest(BaseModel):
     price_level: str | None = None
 
 
+def _shared_sources():
+    return [
+        YelpSource(settings),
+        GooglePlacesSource(settings),
+        FoursquareSource(settings),
+        LocalSampleSource(),
+    ]
+
+
 def build_engine() -> RecommendationEngine:
     return RecommendationEngine(
-        sources=[
-            YelpSource(settings),
-            GooglePlacesSource(settings),
-            FoursquareSource(settings),
-            LocalSampleSource(),
-        ],
+        sources=_shared_sources(),
         preference_store=JsonPreferenceStore(settings.preferences_file),
         fraud_detector=HeuristicFraudDetector(),
         ai_reasoner=ExternalAIReasoner(settings),
@@ -51,16 +56,27 @@ def build_engine() -> RecommendationEngine:
     )
 
 
+def build_agent() -> RestaurantAgent:
+    return RestaurantAgent(
+        sources=_shared_sources(),
+        preference_store=JsonPreferenceStore(settings.preferences_file),
+        fraud_detector=HeuristicFraudDetector(),
+        scoring_service=ScoringService(),
+        settings=settings,
+    )
+
+
 app = FastAPI(
     title="Restaurant Agent",
     description=(
-        "Automatic restaurant recommendation engine with preference learning, "
-        "multi-source retrieval, and fraud/viral risk warnings."
+        "AI-agent-powered restaurant recommendation engine with preference learning, "
+        "multi-source retrieval, LLM-driven tool calling, and fraud/viral risk warnings."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 engine = build_engine()
+agent = build_agent()
 
 
 @app.get("/health")
@@ -94,6 +110,39 @@ def feedback(payload: FeedbackRequest) -> dict[str, str]:
         price_level=payload.price_level,
     )
     return {"status": "saved"}
+
+
+@app.post("/agent/recommend")
+def agent_recommend(payload: RecommendationRequest) -> dict:
+    """LLM-driven agentic recommendation endpoint.
+
+    Uses ``RestaurantAgent`` which lets the LLM autonomously decide which
+    tools to call (search, fraud-check, score-and-rank) and in what order.
+    Falls back to the deterministic pipeline when no AI key is configured.
+    """
+    query = SearchQuery(
+        where=payload.where,
+        when=payload.when,
+        category=payload.category,
+        price_preference=payload.price_preference,
+        travel_plan=payload.travel_plan,
+        party_size=payload.party_size,
+    )
+    result = agent.run(user_id=payload.user_id, query=query, top_n=payload.top_n)
+    return {
+        "used_agent": result.used_agent,
+        "agent_steps": [
+            {
+                "step": s.step,
+                "tool": s.tool,
+                "inputs": s.inputs,
+                "result": s.result,
+            }
+            for s in result.steps
+        ],
+        "best_match": _to_output(result.recommendations[0]) if result.recommendations else None,
+        "recommendations": [_to_output(rec) for rec in result.recommendations],
+    }
 
 
 def _to_output(rec):
