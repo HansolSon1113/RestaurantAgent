@@ -1,6 +1,24 @@
 # Restaurant Agent
 
-Object-oriented Python AI agent that automatically searches restaurants from broad data sources, ranks by user fit, learns from accept/deny feedback, and warns about suspicious or viral-risk candidates.
+Object-oriented Python **AI agent** that automatically searches restaurants from multiple data sources, ranks by user fit, learns from accept/deny feedback, and warns about suspicious or viral-risk candidates.
+
+## Why this is an AI Agent
+
+The repository ships **two recommendation modes**:
+
+| Mode | Class | How it works |
+|------|-------|-------------|
+| **Pipeline** (`/recommend`) | `RecommendationEngine` | Fixed sequence: collect → score → explain. LLM is called only at the end to generate explanations. |
+| **Agent** (`/agent/recommend`) | `RestaurantAgent` | LLM-driven loop: the model autonomously decides **which tools to call**, in **what order**, and **how many times**, based on observations — a true agentic loop. |
+
+The `RestaurantAgent` satisfies all four properties of an AI agent:
+
+1. **Perception** — receives the user's natural-language query and context.
+2. **Planning / Reasoning** — the LLM reasons about what information is still needed.
+3. **Tool use** — the LLM calls tools (`search_restaurants`, `get_user_preferences`, `assess_fraud_risk`, `score_and_rank`) via OpenAI function calling.
+4. **Reflection / Iteration** — after each tool result the LLM decides whether to call more tools or produce a final answer.
+
+When `AI_API_KEY` is not set, `RestaurantAgent` automatically falls back to the deterministic pipeline so the application keeps working without any AI credentials.
 
 ## Features
 
@@ -12,17 +30,19 @@ Object-oriented Python AI agent that automatically searches restaurants from bro
 - OOP architecture with explicit interfaces for source, preference store, fraud detector, and AI reasoner
 - Preference learning persisted in `data/preferences.json`
 - Fraud/viral-risk detection with warning signals for low-trust listings
-- External AI API integration (OpenAI-compatible `/v1/chat/completions`)
+- External AI API integration (OpenAI-compatible `/v1/chat/completions`) with function/tool calling
+- **Agentic tool-calling loop** (`RestaurantAgent`) with full step trace in API response
 - FastAPI service with deploy-ready Docker files
 
 ## Project Structure
 
-- `app/core/models.py`: Domain models
+- `app/core/models.py`: Domain models (incl. `AgentStep`)
 - `app/core/interfaces.py`: Abstract interfaces for extensibility
-- `app/core/engine.py`: Main orchestration engine
+- `app/core/engine.py`: Deterministic orchestration engine (pipeline mode)
+- `app/core/agent.py`: **`RestaurantAgent`** — LLM-driven agentic loop
 - `app/sources/*`: Data source adapters
 - `app/services/*`: Scoring, fraud detection, preference persistence, AI explanations
-- `app/main.py`: API entrypoint
+- `app/main.py`: API entrypoint (`/recommend`, `/agent/recommend`, `/feedback`)
 
 ## Quick Start (Local)
 
@@ -94,6 +114,8 @@ Menu options:
 
 ### POST `/recommend`
 
+Deterministic pipeline endpoint.
+
 Example body:
 
 ```json
@@ -115,6 +137,23 @@ Response includes:
 - `recommendations[]`
 - per item: score, fraud risk, warnings, and AI reason
 
+### POST `/agent/recommend`
+
+**AI-agent endpoint.** The LLM autonomously calls tools to find, evaluate, and rank restaurants.
+
+Same request body as `/recommend`. Response additionally includes:
+
+- `used_agent` — `true` when the agentic loop ran, `false` when the fallback pipeline was used
+- `agent_steps[]` — full trace of every tool the LLM called:
+  ```json
+  {
+    "step": 0,
+    "tool": "search_restaurants",
+    "inputs": {"city": "Seoul", "category": "korean"},
+    "result": [...]
+  }
+  ```
+
 ### POST `/feedback`
 
 Example body:
@@ -133,5 +172,6 @@ This updates the user profile so later recommendations are personalized.
 ## Notes
 
 - If external data-source API keys are not set, local sample data is used.
-- If `AI_API_KEY` is not set or AI API fails, heuristic explanations are used.
+- If `AI_API_KEY` is not set or the AI API fails, both `/recommend` and `/agent/recommend` fall back to heuristic explanations.
 - Fraud/viral detection is heuristic by default; replace with ML classifier if desired.
+

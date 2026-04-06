@@ -57,3 +57,13 @@ class ScoredRecommendation:
     final_score: float
     warnings: list[str] = field(default_factory=list)
     reason: str = ""
+
+
+@dataclass
+class AgentStep:
+    """Records a single step taken by the RestaurantAgent during its agentic loop."""
+
+    step: int
+    tool: str
+    inputs: dict[str, Any]
+    result: Any
